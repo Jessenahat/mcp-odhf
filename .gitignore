@@ -1,0 +1,22 @@
+# Ignore virtual environments
+.venv/
+venv/
+env/
+
+# Python cache / temp
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS & IDE junk
+.idea/
+.vscode/
+*.log
+
+# Jupyter or notebooks
+.ipynb_checkpoints/
+
+# Mac & Windows
+.DS_Store
+Thumbs.db
