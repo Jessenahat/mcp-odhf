@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+numpy
+sse-starlette
+pydantic
+pdfplumber
+
