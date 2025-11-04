@@ -2,26 +2,31 @@ from pathlib import Path
 from typing import Optional
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from sse_starlette.sse import EventSourceResponse
+import json
+import asyncio
 
 app = FastAPI(title="ODHF MCP Server (Minimal Safe)")
 
-CSV_FILE = Path("odhf_v1.1.csv")   # adjust if you renamed your file
+CSV_FILE = Path("odhf_v1.1.csv")
+df = None
 
 # ---------------- CSV loader (robust encodings) ----------------
-def load_csv_safely(path: Path) -> Optional[pd.DataFrame]:
-    if not path.exists():
-        return None
-    for enc in ("utf-8-sig", "cp1252", "latin1"):
-        try:
-            return pd.read_csv(path, encoding=enc, low_memory=False)
-        except UnicodeDecodeError:
-            continue
-    # last resort: replace bad chars
-    return pd.read_csv(path, encoding="cp1252", errors="replace", low_memory=False)
-
-df = load_csv_safely(CSV_FILE)
+@app.on_event("startup")
+def load_data():
+    global df
+    def load_csv_safely(path: Path) -> Optional[pd.DataFrame]:
+        if not path.exists():
+            return None
+        for enc in ("utf-8-sig", "cp1252", "latin1"):
+            try:
+                return pd.read_csv(path, encoding=enc, low_memory=False)
+            except UnicodeDecodeError:
+                continue
+        return pd.read_csv(path, encoding="cp1252", errors="replace", low_memory=False)
+    df = load_csv_safely(CSV_FILE)
 
 # ---------------- column aliasing ----------------
 ALIAS_MAP = {
@@ -72,6 +77,7 @@ def list_fields():
     if df is None:
         raise HTTPException(status_code=400, detail=f"CSV not found at {CSV_FILE.resolve()}")
     return {"columns": list(df.columns)}
+
 
 # ---------------- search endpoint ----------------
 @app.get("/search_facilities")
@@ -141,20 +147,18 @@ TOOLS_MANIFEST = [
 
 @app.get("/sse_once")
 async def sse_once(_: Request):
-    """Emit a single MCP discovery event, then close (best for ChatGPT)."""
     async def gen():
         payload = {
             "event": "list_tools",
-            "data": {"tools": TOOLS_MANIFEST},  # <-- required shape
+            "data": {"tools": TOOLS_MANIFEST},
         }
-        # raw SSE: event + data + blank line
         yield f"event: message\ndata: {json.dumps(payload)}\n\n"
-        await asyncio.sleep(0.05)  # allow flush, then close
-
+        await asyncio.sleep(0.05)
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no",
         "Access-Control-Allow-Origin": "*",
+        "Content-Type": "text/event-stream; charset=utf-8",
     }
     return EventSourceResponse(gen(), media_type="text/event-stream", headers=headers)
