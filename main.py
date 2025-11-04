@@ -115,110 +115,41 @@ def search_facilities(
 
     return df_to_records_clean(filtered.head(25))
 
-# --- MCP tools + SSE (safe) ---
-from pydantic import BaseModel
-from fastapi import HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
-import asyncio, json, logging
+# --- MCP manifest + one-shot SSE for ChatGPT ---
 from fastapi import Request
+from sse_starlette.sse import EventSourceResponse
+import json, asyncio
 
-log = logging.getLogger("sse")
-
-# CORS for public connector
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=False,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-class EmptyArgs(BaseModel):
-    pass
-
-class SearchFacilitiesArgs(BaseModel):
-    province: str | None = None
-    facility_type: str | None = None
-
-@app.post("/tools/list_fields")
-def tool_list_fields(_: EmptyArgs):
-    if df is None:
-        raise HTTPException(status_code=400, detail="CSV not loaded")
-    return {"ok": True, "tool": "list_fields", "data": list(df.columns)}
-
-@app.post("/tools/search_facilities")
-def tool_search_facilities(args: SearchFacilitiesArgs):
-    if df is None:
-        raise HTTPException(status_code=400, detail="CSV not loaded")
-
-    if COL_PROVINCE is None or COL_TYPE is None:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "Expected columns not found in CSV.",
-                "have": list(df.columns),
-                "need_any_of": {
-                    "province": list(ALIAS_MAP["province"]),
-                    "odhf_facility_type": list(ALIAS_MAP["odhf_facility_type"]),
-                },
-            },
-        )
-
-    try:
-        filt = df
-        if args.province:
-            filt = filt[filt[COL_PROVINCE].astype(str).str.contains(args.province, case=False, na=False)]
-        if args.facility_type:
-            filt = filt[filt[COL_TYPE].astype(str).str.contains(args.facility_type, case=False, na=False)]
-
-        if filt.empty:
-            return {"ok": True, "tool": "search_facilities", "data": [], "note": "No results with those filters."}
-
-        # optional: tidy subset of columns
-        preferred_cols = ["Facility Name", "City", COL_PROVINCE, COL_TYPE, "Postal Code", "Latitude", "Longitude"]
-        use_cols = [c for c in preferred_cols if c in filt.columns]
-        if use_cols:
-            filt = filt[use_cols]
-
-        return {"ok": True, "tool": "search_facilities", "data": df_to_records_clean(filt.head(25))}
-    except Exception as e:
-        # return 400 with the actual error text instead of 500
-        raise HTTPException(status_code=400, detail=f"search_facilities failed: {e}")
-
-# Minimal SSE: exposes the tools to ChatGPT
 TOOLS_MANIFEST = [
     {
         "name": "list_fields",
         "description": "List dataset columns",
-        "args_schema": {}
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "search_facilities",
-        "description": "Filter by province and/or ODHF facility type",
-        "args_schema": {"province": "string?", "facility_type": "string?"}
+        "description": "Search facilities by province and/or ODHF facility type",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "province": {"type": "string"},
+                "facility_type": {"type": "string"},
+            },
+        },
     },
 ]
 
-@app.get("/sse")
-async def sse(request: Request):
-    log.warning("Nova conexão SSE recebida")
-
+@app.get("/sse_once")
+async def sse_once(_: Request):
+    """Emit a single MCP discovery event, then close (best for ChatGPT)."""
     async def gen():
-        # 🔹 Evento 1: lista de ferramentas (ChatGPT espera isso)
-        yield {
-            "event": "message",
-            "data": json.dumps({
-                "event": "list_tools",
-                "data": TOOLS_MANIFEST
-            })
+        payload = {
+            "event": "list_tools",
+            "data": {"tools": TOOLS_MANIFEST},  # <-- required shape
         }
-
-        # 🔹 Loop de keepalive
-        while True:
-            if await request.is_disconnected():
-                log.warning("SSE desconectado")
-                break
-            await asyncio.sleep(10)
-            yield {"event": "ping", "data": "keepalive"}
+        # raw SSE: event + data + blank line
+        yield f"event: message\ndata: {json.dumps(payload)}\n\n"
+        await asyncio.sleep(0.05)  # allow flush, then close
 
     headers = {
         "Cache-Control": "no-cache",
@@ -226,5 +157,4 @@ async def sse(request: Request):
         "X-Accel-Buffering": "no",
         "Access-Control-Allow-Origin": "*",
     }
-
-    return EventSourceResponse(gen(), headers=headers, media_type="text/event-stream")
+    return EventSourceResponse(gen(), media_type="text/event-stream", headers=headers)
