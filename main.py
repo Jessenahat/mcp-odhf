@@ -1,48 +1,65 @@
 from pathlib import Path
-from typing import Optional
-import pandas as pd
+from typing import Optional, List, Dict, Any
+
+import asyncio
+import json
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from sse_starlette.sse import EventSourceResponse
-import json
-import asyncio
 
 app = FastAPI(title="ODHF MCP Server (Minimal Safe)")
 
+# ---------- CORS (public, no auth) ----------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
 CSV_FILE = Path("odhf_v1.1.csv")
-df = None
 
-# --- Load CSV in background on startup (not during import)
-@app.on_event("startup")
-def load_data():
-    global df
-    def load_csv_safely(path: Path) -> Optional[pd.DataFrame]:
-        if not path.exists():
-            return None
-        for enc in ("utf-8-sig", "cp1252", "latin1"):
-            try:
-                return pd.read_csv(path, encoding=enc, low_memory=False)
-            except UnicodeDecodeError:
-                continue
-        return pd.read_csv(path, encoding="cp1252", errors="replace", low_memory=False)
-    df = load_csv_safely(CSV_FILE)
+# ---------- Lazy CSV loader (fast cold start) ----------
+_df: Optional[pd.DataFrame] = None
 
-# --- Column aliasing helper ---
+
+def load_csv_safely(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    for enc in ("utf-8-sig", "cp1252", "latin1"):
+        try:
+            return pd.read_csv(path, encoding=enc, low_memory=False)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path, encoding="cp1252", errors="replace", low_memory=False)
+
+
+def get_df() -> Optional[pd.DataFrame]:
+    """Load once on first use (don’t block startup/SSE)."""
+    global _df
+    if _df is None:
+        _df = load_csv_safely(CSV_FILE)
+    return _df
+
+
+# ---------- Column aliasing ----------
 ALIAS_MAP = {
     "province": {
         "province", "Province", "Province or Territory", "Province/Territory",
-        "prov", "province_or_territory"
+        "prov", "province_or_territory",
     },
     "odhf_facility_type": {
         "odhf_facility_type", "ODHF Facility Type", "Facility Type", "facility_type",
-        "odhf facility type"
+        "odhf facility type",
     },
 }
-def find_col(candidates: set[str]) -> Optional[str]:
-    global df
-    if df is None:
-        return None
+
+
+def find_col(df: pd.DataFrame, candidates: set[str]) -> Optional[str]:
     cols = list(df.columns)
     lower = {c.lower(): c for c in cols}
     for want in candidates:
@@ -52,39 +69,43 @@ def find_col(candidates: set[str]) -> Optional[str]:
             return lower[want.lower()]
     return None
 
-# --- JSON-safe conversion helper ---
-def df_to_records_clean(frame: pd.DataFrame):
+
+# ---------- JSON-safe conversion ----------
+def df_to_records_clean(frame: pd.DataFrame) -> List[Dict[str, Any]]:
     safe = frame.replace([np.inf, -np.inf], np.nan)
     safe = safe.where(pd.notna(safe), None)
     return safe.to_dict(orient="records")
 
-# --- Health/debug endpoint ---
+
+# ---------- Health ----------
 @app.get("/", response_class=PlainTextResponse)
 def root():
-    global df
+    df = get_df()
     rows = None if df is None else int(len(df))
     return f"ODHF MCP Server is running! csv_found={CSV_FILE.exists()} rows={rows}"
 
-# --- List columns endpoint ---
+
+# ---------- List columns ----------
 @app.get("/list_fields")
 def list_fields():
-    global df
+    df = get_df()
     if df is None:
         raise HTTPException(status_code=400, detail=f"CSV not found at {CSV_FILE.resolve()}")
     return {"columns": list(df.columns)}
 
-# --- Search endpoint ---
+
+# ---------- Search ----------
 @app.get("/search_facilities")
 def search_facilities(
     province: str = Query(None, description="Province or territory (e.g., Quebec, QC)"),
     facility_type: str = Query(None, description="ODHF facility type (e.g., Hospitals)"),
 ):
-    global df
+    df = get_df()
     if df is None:
         raise HTTPException(status_code=400, detail=f"CSV not found at {CSV_FILE.resolve()}")
 
-    col_province = find_col(ALIAS_MAP["province"])
-    col_type = find_col(ALIAS_MAP["odhf_facility_type"])
+    col_province = find_col(df, ALIAS_MAP["province"])
+    col_type = find_col(df, ALIAS_MAP["odhf_facility_type"])
     if col_province is None or col_type is None:
         raise HTTPException(
             status_code=400,
@@ -107,17 +128,15 @@ def search_facilities(
     if filtered.empty:
         return {"message": "No results. Try another province (e.g., 'QC'/'Quebec') or facility_type."}
 
-    preferred_cols = [
-        "Facility Name", "City", col_province, col_type,
-        "Postal Code", "Latitude", "Longitude"
-    ]
+    preferred_cols = ["Facility Name", "City", col_province, col_type, "Postal Code", "Latitude", "Longitude"]
     subset = [c for c in preferred_cols if c in filtered.columns]
     if subset:
         filtered = filtered[subset]
 
     return df_to_records_clean(filtered.head(25))
 
-# --- MCP manifest + one-shot SSE for ChatGPT (timout fix) ---
+
+# ---------- MCP manifest + SSE ----------
 TOOLS_MANIFEST = [
     {
         "name": "list_fields",
@@ -137,15 +156,38 @@ TOOLS_MANIFEST = [
     },
 ]
 
+
 @app.get("/sse_once")
 async def sse_once(_: Request):
+    """Emit a single MCP discovery event, then close (best for ChatGPT)."""
     async def gen():
-        payload = {
-            "event": "list_tools",
-            "data": {"tools": TOOLS_MANIFEST},
-        }
-        yield f"event: message\ndata: {json.dumps(payload)}\n\n"
+        payload = {"event": "list_tools", "data": {"tools": TOOLS_MANIFEST}}
+        # ✅ yield dict (EventSourceResponse formats SSE lines correctly)
+        yield {"event": "message", "data": json.dumps(payload)}
         await asyncio.sleep(0.05)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "text/event-stream; charset=utf-8",
+    }
+    return EventSourceResponse(gen(), media_type="text/event-stream", headers=headers)
+
+
+@app.get("/sse")
+async def sse(request: Request):
+    """Debug SSE stream with periodic pings."""
+    async def gen():
+        first = {"event": "list_tools", "data": {"tools": TOOLS_MANIFEST}}
+        yield {"event": "message", "data": json.dumps(first)}
+        while True:
+            if await request.is_disconnected():
+                break
+            await asyncio.sleep(10)
+            yield {"event": "ping", "data": "keepalive"}
+
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
