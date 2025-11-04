@@ -121,6 +121,7 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 import asyncio, json
+from fastapi import Request
 
 # CORS for public connector
 app.add_middleware(
@@ -183,13 +184,32 @@ def tool_search_facilities(args: SearchFacilitiesArgs):
 
 # Minimal SSE: exposes the tools to ChatGPT
 TOOLS_MANIFEST = [
-    {"name": "list_fields", "description": "List dataset column names", "args_schema": {}},
-    {"name": "search_facilities", "description": "Filter by province and/or ODHF facility type", "args_schema": {"province":"string?","facility_type":"string?"}},
+    {"name": "list_fields", "description": "List dataset columns", "args_schema": {}},
+    {"name": "search_facilities", "description": "Filter by province and/or ODHF facility type",
+     "args_schema": {"province":"string?","facility_type":"string?"}},
 ]
 
 @app.get("/sse")
-async def sse():
-    async def gen():
-        yield {"event": "message", "data": json.dumps({"event": "list_tools", "data": TOOLS_MANIFEST})}
-        await asyncio.sleep(0.1)
-    return EventSourceResponse(gen())
+async def sse(request: Request):
+    async def eventgen():
+        # 1) Primeiro evento IMEDIATO (descoberta de ferramentas)
+        payload = {"event": "list_tools", "data": TOOLS_MANIFEST}
+        yield {"event": "message", "data": json.dumps(payload)}
+
+        # 2) Keepalive periódico (evita timeout de proxy)
+        while True:
+            if await request.is_disconnected():
+                break
+            await asyncio.sleep(10)
+            yield {"event": "ping", "data": "keepalive"}
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",   # evita buffer em proxies
+    }
+    return EventSourceResponse(
+        eventgen(),
+        media_type="text/event-stream",
+        headers=headers
+    )
