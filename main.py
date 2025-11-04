@@ -13,7 +13,7 @@ app = FastAPI(title="ODHF MCP Server (Minimal Safe)")
 CSV_FILE = Path("odhf_v1.1.csv")
 df = None
 
-# ---------------- CSV loader (robust encodings) ----------------
+# --- Load CSV in background on startup (not during import)
 @app.on_event("startup")
 def load_data():
     global df
@@ -28,7 +28,7 @@ def load_data():
         return pd.read_csv(path, encoding="cp1252", errors="replace", low_memory=False)
     df = load_csv_safely(CSV_FILE)
 
-# ---------------- column aliasing ----------------
+# --- Column aliasing helper ---
 ALIAS_MAP = {
     "province": {
         "province", "Province", "Province or Territory", "Province/Territory",
@@ -39,8 +39,8 @@ ALIAS_MAP = {
         "odhf facility type"
     },
 }
-
 def find_col(candidates: set[str]) -> Optional[str]:
+    global df
     if df is None:
         return None
     cols = list(df.columns)
@@ -52,43 +52,40 @@ def find_col(candidates: set[str]) -> Optional[str]:
             return lower[want.lower()]
     return None
 
-COL_PROVINCE = find_col(ALIAS_MAP["province"])
-COL_TYPE     = find_col(ALIAS_MAP["odhf_facility_type"])
-
-# ---------------- JSON-safe conversion helper ----------------
+# --- JSON-safe conversion helper ---
 def df_to_records_clean(frame: pd.DataFrame):
-    """
-    Convert a DataFrame to JSON-safe records:
-    - replace NaN/NaT with None
-    - replace ±inf with None
-    """
     safe = frame.replace([np.inf, -np.inf], np.nan)
     safe = safe.where(pd.notna(safe), None)
     return safe.to_dict(orient="records")
 
-# ---------------- simple health/debug ----------------
+# --- Health/debug endpoint ---
 @app.get("/", response_class=PlainTextResponse)
 def root():
+    global df
     rows = None if df is None else int(len(df))
     return f"ODHF MCP Server is running! csv_found={CSV_FILE.exists()} rows={rows}"
 
+# --- List columns endpoint ---
 @app.get("/list_fields")
 def list_fields():
+    global df
     if df is None:
         raise HTTPException(status_code=400, detail=f"CSV not found at {CSV_FILE.resolve()}")
     return {"columns": list(df.columns)}
 
-
-# ---------------- search endpoint ----------------
+# --- Search endpoint ---
 @app.get("/search_facilities")
 def search_facilities(
     province: str = Query(None, description="Province or territory (e.g., Quebec, QC)"),
     facility_type: str = Query(None, description="ODHF facility type (e.g., Hospitals)"),
 ):
+    global df
     if df is None:
         raise HTTPException(status_code=400, detail=f"CSV not found at {CSV_FILE.resolve()}")
 
-    if COL_PROVINCE is None or COL_TYPE is None:
+    col_province = find_col(ALIAS_MAP["province"])
+    col_type = find_col(ALIAS_MAP["odhf_facility_type"])
+    if col_province is None or col_type is None:
         raise HTTPException(
             status_code=400,
             detail={
@@ -103,16 +100,15 @@ def search_facilities(
 
     filtered = df
     if province:
-        filtered = filtered[filtered[COL_PROVINCE].astype(str).str.contains(province, case=False, na=False)]
+        filtered = filtered[filtered[col_province].astype(str).str.contains(province, case=False, na=False)]
     if facility_type:
-        filtered = filtered[filtered[COL_TYPE].astype(str).str.contains(facility_type, case=False, na=False)]
+        filtered = filtered[filtered[col_type].astype(str).str.contains(facility_type, case=False, na=False)]
 
     if filtered.empty:
         return {"message": "No results. Try another province (e.g., 'QC'/'Quebec') or facility_type."}
 
-    # (optional) choose a tidy subset of columns if you like:
     preferred_cols = [
-        "Facility Name", "City", COL_PROVINCE, COL_TYPE,
+        "Facility Name", "City", col_province, col_type,
         "Postal Code", "Latitude", "Longitude"
     ]
     subset = [c for c in preferred_cols if c in filtered.columns]
@@ -121,11 +117,7 @@ def search_facilities(
 
     return df_to_records_clean(filtered.head(25))
 
-# --- MCP manifest + one-shot SSE for ChatGPT ---
-from fastapi import Request
-from sse_starlette.sse import EventSourceResponse
-import json, asyncio
-
+# --- MCP manifest + one-shot SSE for ChatGPT (timout fix) ---
 TOOLS_MANIFEST = [
     {
         "name": "list_fields",
