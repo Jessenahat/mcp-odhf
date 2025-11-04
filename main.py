@@ -120,8 +120,10 @@ from pydantic import BaseModel
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-import asyncio, json
+import asyncio, json, logging
 from fastapi import Request
+
+log = logging.getLogger("sse")
 
 # CORS for public connector
 app.add_middleware(
@@ -184,21 +186,36 @@ def tool_search_facilities(args: SearchFacilitiesArgs):
 
 # Minimal SSE: exposes the tools to ChatGPT
 TOOLS_MANIFEST = [
-    {"name": "list_fields", "description": "List dataset columns", "args_schema": {}},
-    {"name": "search_facilities", "description": "Filter by province and/or ODHF facility type",
-     "args_schema": {"province":"string?","facility_type":"string?"}},
+    {
+        "name": "list_fields",
+        "description": "List dataset columns",
+        "args_schema": {}
+    },
+    {
+        "name": "search_facilities",
+        "description": "Filter by province and/or ODHF facility type",
+        "args_schema": {"province": "string?", "facility_type": "string?"}
+    },
 ]
 
 @app.get("/sse")
 async def sse(request: Request):
-    async def eventgen():
-        # 1) Primeiro evento IMEDIATO (descoberta de ferramentas)
-        payload = {"event": "list_tools", "data": TOOLS_MANIFEST}
-        yield {"event": "message", "data": json.dumps(payload)}
+    log.warning("Nova conexão SSE recebida")
 
-        # 2) Keepalive periódico (evita timeout de proxy)
+    async def gen():
+        # 🔹 Evento 1: lista de ferramentas (ChatGPT espera isso)
+        yield {
+            "event": "message",
+            "data": json.dumps({
+                "event": "list_tools",
+                "data": TOOLS_MANIFEST
+            })
+        }
+
+        # 🔹 Loop de keepalive
         while True:
             if await request.is_disconnected():
+                log.warning("SSE desconectado")
                 break
             await asyncio.sleep(10)
             yield {"event": "ping", "data": "keepalive"}
@@ -206,10 +223,8 @@ async def sse(request: Request):
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",   # evita buffer em proxies
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin": "*",
     }
-    return EventSourceResponse(
-        eventgen(),
-        media_type="text/event-stream",
-        headers=headers
-    )
+
+    return EventSourceResponse(gen(), headers=headers, media_type="text/event-stream")
